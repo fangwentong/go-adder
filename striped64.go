@@ -19,10 +19,6 @@ func (s *striped64) casBase(cmp, val int64) bool {
 	return atomic.CompareAndSwapInt64(&s.base, cmp, val)
 }
 
-func (s *striped64) getAndSetBase(val int64) int64 {
-	return atomic.SwapInt64(&s.base, val)
-}
-
 func (s *striped64) casCellsBusy() bool {
 	return atomic.CompareAndSwapInt32(&s.cellsBusy, 0, 1)
 }
@@ -144,8 +140,8 @@ func advanceProbe(ctx context.Context, probe int32) int32 {
 }
 
 type cell struct {
-	value   int64    // volatile
-	padding [7]int64 // padding for cpu cache-line align
+	value int64    // volatile
+	_     [7]int64 // padding for cpu cache-line align
 }
 
 func (c *cell) cas(cmp, val int64) bool {

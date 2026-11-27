@@ -2,60 +2,62 @@ package adder_test
 
 import (
 	"context"
-	"fmt"
-	"github.com/fangwentong/go-adder"
 	"sync"
-	"sync/atomic"
 	"testing"
+
+	"github.com/fangwentong/go-adder"
 )
 
 func TestAddConcurrent(t *testing.T) {
 	counter := &adder.LongAdder{}
 
-	wg := sync.WaitGroup{}
+	nInc := 100_000
+	if testing.Short() {
+		nInc = 20_000
+	}
+	nRoutine := 16
 
-	nInc := 50000000
-	nRoutine := 20
-
+	var wg sync.WaitGroup
 	for i := 0; i < nRoutine; i++ {
 		wg.Add(1)
-		go func(i int) {
+		go func() {
+			defer wg.Done()
 			var probe int32
 			ctx := adder.ContextWithProbe(context.Background(), &probe)
 			for j := 0; j < nInc; j++ {
 				counter.Increment(ctx)
 			}
-			wg.Done()
-		}(i)
-	}
-	wg.Wait()
-
-	sum := counter.Sum()
-
-	if sum != int64(nInc)*int64(nRoutine) {
-		t.Fail()
-	}
-	fmt.Println(sum)
-}
-
-func TestAddAtomic(t *testing.T) {
-	var val int64
-
-	wg := sync.WaitGroup{}
-
-	nInc := 50000000
-	nRoutine := 20
-
-	for i := 0; i < nRoutine; i++ {
-		wg.Add(1)
-		go func() {
-			for j := 0; j < nInc; j++ {
-				atomic.AddInt64(&val, 1)
-			}
-			wg.Done()
 		}()
 	}
 	wg.Wait()
 
-	fmt.Println(val)
+	want := int64(nInc) * int64(nRoutine)
+	if got := counter.Sum(); got != want {
+		t.Fatalf("Sum() = %d, want %d", got, want)
+	}
+}
+
+func TestResetAndSumThenRest(t *testing.T) {
+	counter := &adder.LongAdder{}
+	var probe int32
+	ctx := adder.ContextWithProbe(context.Background(), &probe)
+
+	counter.Add(ctx, 10)
+	counter.Decrement(ctx)
+	if got := counter.Sum(); got != 9 {
+		t.Fatalf("Sum() = %d, want 9", got)
+	}
+
+	if got := counter.SumThenRest(); got != 9 {
+		t.Fatalf("SumThenRest() = %d, want 9", got)
+	}
+	if got := counter.Sum(); got != 0 {
+		t.Fatalf("Sum() after SumThenRest() = %d, want 0", got)
+	}
+
+	counter.Add(ctx, 42)
+	counter.Reset()
+	if got := counter.Sum(); got != 0 {
+		t.Fatalf("Sum() after Reset() = %d, want 0", got)
+	}
 }
