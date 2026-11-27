@@ -47,10 +47,8 @@ func (l *LongAdder) Decrement(ctx context.Context) {
 func (l *LongAdder) Sum() int64 {
 	cs, _ := l.cells.Load().([]*cell)
 	sum := atomic.LoadInt64(&l.base)
-	if cs != nil {
-		for _, c := range cs {
-			sum += atomic.LoadInt64(&c.value)
-		}
+	for _, c := range cs {
+		sum += atomic.LoadInt64(&c.value)
 	}
 	return sum
 }
@@ -58,20 +56,16 @@ func (l *LongAdder) Sum() int64 {
 func (l *LongAdder) Reset() {
 	cs, _ := l.cells.Load().([]*cell)
 	atomic.StoreInt64(&l.base, 0)
-	if cs != nil {
-		for _, c := range cs {
-			c.reset(0)
-		}
+	for _, c := range cs {
+		c.reset(0)
 	}
 }
 
 func (l *LongAdder) SumThenRest() int64 {
 	cs, _ := l.cells.Load().([]*cell)
 	sum := atomic.SwapInt64(&l.base, 0)
-	if cs != nil {
-		for _, c := range cs {
-			sum += c.getAndSet(0)
-		}
+	for _, c := range cs {
+		sum += c.getAndSet(0)
 	}
 	return sum
 }
