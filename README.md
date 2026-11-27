@@ -1,80 +1,54 @@
-go-adder
----
+# go-adder
 
-This is a port of
-the [Java's LongAdder](https://docs.oracle.com/en/java/javase/17/docs/api/java.base/java/util/concurrent/atomic/LongAdder.html)
-into the Go programming language.
+A high-concurrency striped `int64` counter for Go (Go 1.22+), inspired by Java's `LongAdder`.
+
+Under low contention it performs a single atomic CAS on `base`. Under high contention it lazily stripes updates across
+128-byte cache-line-padded cells selected using Go 1.22+'s lock-free per-M `math/rand/v2` without requiring `context`
+plumbing or `go:linkname`.
 
 ## Usage
 
 ```go
-package test
+package main
 
-import "github.com/fangwentong/go-adder"
-import "context"
+import (
+	"fmt"
 
-var counter = &adder.LongAdder{}
+	"github.com/fangwentong/go-adder"
+)
 
-func ExampleFunc(ctx context.Context)  {
-    // inject goroutine probe
-    var probe int32
-    ctx = adder.ContextWithProbe(ctx, &probe)
+func main() {
+	var counter adder.LongAdder // zero value is ready to use
 
-    counter.Add(ctx, 2)
-    counter.Add(ctx, -2)
+	counter.Add(2)
+	counter.Inc()
+	counter.Dec()
 
-    // counter +1
-    counter.Increment(ctx)
-    // counter -1
-    counter.Decrement(ctx)
-
-    // get current count
-    counter.Sum()
-
-    // reset current count
-    counter.Reset()
-
-    // get current count then reset
-    counter.SumThenRest()
+	fmt.Println(counter.Sum())         // 2
+	fmt.Println(counter.SumAndReset()) // 2 (then zeroed)
+	counter.Reset()
 }
 ```
 
+## Consistency Semantics
+
+- `Sum()` iterates over `base` and allocated stripes; it is **not** an atomic snapshot under concurrent updates.
+- `SumAndReset()` is also not a linearizable point-in-time snapshot, but because it drains `base` and every stripe
+  with atomic `Swap`, increments are conserved across successive calls without loss.
+- `Reset()` uses plain atomic stores; concurrent updates racing with `Reset()` may be lost.
+- Do not copy a `LongAdder` after first use.
+
 ## Benchmark
 
-running on MacOS powered by Intel [Coffee Lake](https://en.wikichip.org/wiki/intel/microarchitectures/coffee_lake) 6
-core 12 thread
+Measured with `go test -bench=BenchmarkCounterComparison -benchtime=300ms` on `darwin/arm64` (Apple M5 Max,
+`GOMAXPROCS=18`, where `p` is `b.SetParallelism(p)` = `p * GOMAXPROCS` goroutines):
 
-```
-$ go test -run=nothing -bench=. -cpu=1,2,4,8,16,32,64,128 -benchtime=5s
-goos: darwin
-goarch: amd64
-pkg: github.com/fangwentong/go-adder
-cpu: Intel(R) Core(TM) i7-9750H CPU @ 2.60GHz
-BenchmarkLongAdder                      691230033                8.824 ns/op
-BenchmarkLongAdder-2                    687713216               18.45 ns/op
-BenchmarkLongAdder-4                    477778184               12.29 ns/op
-BenchmarkLongAdder-8                    1000000000               2.966 ns/op
-BenchmarkLongAdder-16                   1000000000               2.573 ns/op
-BenchmarkLongAdder-32                   1000000000               2.025 ns/op
-BenchmarkLongAdder-64                   1000000000               2.373 ns/op
-BenchmarkLongAdder-128                  1000000000               2.297 ns/op
-BenchmarkLongAdderEmptyCtx              519916878               12.42 ns/op
-BenchmarkLongAdderEmptyCtx-2            160806240               36.50 ns/op
-BenchmarkLongAdderEmptyCtx-4            172157611               32.71 ns/op
-BenchmarkLongAdderEmptyCtx-8            222932665               28.26 ns/op
-BenchmarkLongAdderEmptyCtx-16           231772944               26.73 ns/op
-BenchmarkLongAdderEmptyCtx-32           238532882               24.33 ns/op
-BenchmarkLongAdderEmptyCtx-64           254754256               24.61 ns/op
-BenchmarkLongAdderEmptyCtx-128          244789734               24.35 ns/op
-BenchmarkAtomicLong                     802940997                6.566 ns/op
-BenchmarkAtomicLong-2                   366768531               15.57 ns/op
-BenchmarkAtomicLong-4                   388438527               15.96 ns/op
-BenchmarkAtomicLong-8                   361224614               16.80 ns/op
-BenchmarkAtomicLong-16                  385923369               18.04 ns/op
-BenchmarkAtomicLong-32                  370266336               15.54 ns/op
-BenchmarkAtomicLong-64                  387258997               16.38 ns/op
-BenchmarkAtomicLong-128                 307278933               18.82 ns/op
-PASS
-ok      github.com/fangwentong/go-adder 177.124s
-```
+| Parallelism (`p`) | `LongAdder.Inc()` | `atomic.Int64.Add(1)` |
+| --- | --- | --- |
+| `p=1` (18 goroutines) | `12.91 ns/op` | `13.51 ns/op` |
+| `p=8` (144 goroutines) | `12.33 ns/op` | `14.55 ns/op` |
+| `p=18` (324 goroutines) | `11.90 ns/op` | `14.47 ns/op` |
 
+## License
+
+MIT License. See [LICENSE](LICENSE).

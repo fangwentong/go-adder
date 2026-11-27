@@ -1,48 +1,41 @@
 package adder_test
 
 import (
-	"context"
-	"github.com/fangwentong/go-adder"
-	"math/rand"
+	"fmt"
+	"runtime"
 	"sync/atomic"
 	"testing"
+
+	"github.com/fangwentong/go-adder"
 )
 
-func BenchmarkLongAdder(b *testing.B) {
-	var counter = &adder.LongAdder{}
-	b.RunParallel(func(pb *testing.PB) {
-		probe := rand.Int31()
-		ctx := adder.ContextWithProbe(context.Background(), &probe)
-		for pb.Next() {
-			counter.Increment(ctx)
-		}
-	})
-	if counter.Sum() != int64(b.N) {
-		b.Fail()
-	}
-}
+func BenchmarkCounterComparison(b *testing.B) {
+	parallelisms := []int{1, 8, runtime.GOMAXPROCS(0)}
+	for _, p := range parallelisms {
+		b.Run(fmt.Sprintf("LongAdder/p=%d", p), func(b *testing.B) {
+			var counter adder.LongAdder
+			b.SetParallelism(p)
+			b.RunParallel(func(pb *testing.PB) {
+				for pb.Next() {
+					counter.Inc()
+				}
+			})
+			if counter.Sum() != int64(b.N) {
+				b.Fatalf("Sum() = %d, want %d", counter.Sum(), b.N)
+			}
+		})
 
-func BenchmarkLongAdderEmptyCtx(b *testing.B) {
-	var counter = &adder.LongAdder{}
-	b.RunParallel(func(pb *testing.PB) {
-		ctx := context.Background()
-		for pb.Next() {
-			counter.Increment(ctx)
-		}
-	})
-	if counter.Sum() != int64(b.N) {
-		b.Fail()
-	}
-}
-
-func BenchmarkAtomicLong(b *testing.B) {
-	var val int64
-	b.RunParallel(func(pb *testing.PB) {
-		for pb.Next() {
-			atomic.AddInt64(&val, 1)
-		}
-	})
-	if atomic.LoadInt64(&val) != int64(b.N) {
-		b.Fail()
+		b.Run(fmt.Sprintf("AtomicInt64/p=%d", p), func(b *testing.B) {
+			var counter atomic.Int64
+			b.SetParallelism(p)
+			b.RunParallel(func(pb *testing.PB) {
+				for pb.Next() {
+					counter.Add(1)
+				}
+			})
+			if counter.Load() != int64(b.N) {
+				b.Fatalf("Load() = %d, want %d", counter.Load(), b.N)
+			}
+		})
 	}
 }
