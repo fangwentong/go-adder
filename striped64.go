@@ -1,19 +1,49 @@
 package adder
 
 import (
-	"context"
-	"math/rand"
+	"math/rand/v2"
 	"runtime"
 	"sync/atomic"
 )
 
-type striped64 struct {
-	cells     atomic.Value // []*cell
-	base      int64        // volatile
-	cellsBusy int32        // volatile
+const cacheLineSize = 128
+
+// cell holds a single striped int64 counter padded to 128 bytes to avoid false sharing
+// on both 64-byte (x86_64) and 128-byte (Apple Silicon / ARM64) cache-line architectures.
+type cell struct {
+	value int64
+	_     [cacheLineSize - 8]byte
 }
 
-var nCPU = runtime.GOMAXPROCS(0)
+func (c *cell) cas(cmp, val int64) bool {
+	return atomic.CompareAndSwapInt64(&c.value, cmp, val)
+}
+
+func (c *cell) reset(val int64) {
+	atomic.StoreInt64(&c.value, val)
+}
+
+func (c *cell) swap(val int64) int64 {
+	return atomic.SwapInt64(&c.value, val)
+}
+
+// cellTable wraps the striped cell slice so atomic.Pointer can swap tables without
+// interface boxing allocations and compare table identity via pointer equality.
+// maxLen caches the target stripe cap at table creation/resize so the hot contention
+// path never calls runtime.GOMAXPROCS(0) (which acquires the global scheduler lock).
+type cellTable struct {
+	cells  []*cell
+	maxLen int
+}
+
+type striped64 struct {
+	cells     atomic.Pointer[cellTable]
+	_         [cacheLineSize - 8]byte
+	base      int64
+	_         [cacheLineSize - 8]byte
+	cellsBusy int32
+	_         [cacheLineSize - 4]byte
+}
 
 func (s *striped64) casBase(cmp, val int64) bool {
 	return atomic.CompareAndSwapInt64(&s.base, cmp, val)
@@ -23,135 +53,75 @@ func (s *striped64) casCellsBusy() bool {
 	return atomic.CompareAndSwapInt32(&s.cellsBusy, 0, 1)
 }
 
-func (s *striped64) longAccumulate(ctx context.Context, x int64, fn func(int64, int64) int64, wasUncontended bool, index int32) {
-	if index == 0 {
-		index = initProbe(ctx)
-		wasUncontended = true
+func maxCells() int {
+	p := runtime.GOMAXPROCS(0)
+	if p <= 2 {
+		return 2
 	}
+	// Round up to the next power of two so index masking (len-1) stays uniform.
+	n := 1
+	for n < p {
+		n <<= 1
+	}
+	return n
+}
+
+func (s *striped64) longAccumulate(x int64, wasUncontended bool) {
+	probe := rand.Uint32()
 	collide := false
 	for {
-		cs, _ := s.cells.Load().([]*cell)
-		n := len(cs)
-		if cs != nil && n > 0 {
-			c := cs[(n-1)&int(index)]
-			if !wasUncontended { // CAS already known to fail
-				wasUncontended = true // Continue after rehash
-				index = advanceProbe(ctx, index)
+		tbl := s.cells.Load()
+		if tbl != nil && len(tbl.cells) > 0 {
+			cs := tbl.cells
+			n := len(cs)
+			c := cs[int(probe)&(n-1)]
+			if !wasUncontended {
+				wasUncontended = true
+				probe = rand.Uint32()
 				continue
 			}
 			v := atomic.LoadInt64(&c.value)
-			var newVal int64
-			if fn == nil {
-				newVal = v + x
-			} else {
-				newVal = fn(v, x)
+			if c.cas(v, v+x) {
+				return
 			}
-			if c.cas(v, newVal) {
-				break
-			} else if n >= nCPU || !s.isSameReference(cs) {
-				collide = false // At max size or stale
+			if n >= tbl.maxLen || s.cells.Load() != tbl {
+				collide = false
 			} else if !collide {
 				collide = true
 			} else if atomic.LoadInt32(&s.cellsBusy) == 0 && s.casCellsBusy() {
-				if s.isSameReference(cs) {
-					rs := make([]*cell, n<<1)
-					copy(rs, cs)
-					for i := len(cs); i < len(rs); i++ {
-						rs[i] = &cell{}
+				if s.cells.Load() == tbl {
+					capLimit := maxCells()
+					if n < capLimit {
+						rs := make([]*cell, n<<1)
+						copy(rs, cs)
+						for i := n; i < len(rs); i++ {
+							rs[i] = &cell{}
+						}
+						s.cells.Store(&cellTable{cells: rs, maxLen: capLimit})
+					} else {
+						// Refresh cached cap if GOMAXPROCS decreased since table allocation.
+						s.cells.Store(&cellTable{cells: cs, maxLen: capLimit})
 					}
-					s.cells.Store(rs)
 				}
 				atomic.StoreInt32(&s.cellsBusy, 0)
 				collide = false
 				continue
 			}
-			index = advanceProbe(ctx, index)
-		} else if atomic.LoadInt32(&s.cellsBusy) == 0 && s.isSameReference(cs) && s.casCellsBusy() {
-			if s.isSameReference(cs) {
-				rs := make([]*cell, 2)
-				rs[index&1] = &cell{value: x}
-				rs[1-index&1] = &cell{}
-				s.cells.Store(rs)
+			probe = rand.Uint32()
+		} else if atomic.LoadInt32(&s.cellsBusy) == 0 && s.cells.Load() == tbl && s.casCellsBusy() {
+			if s.cells.Load() == tbl {
+				rs := []*cell{{}, {}}
+				rs[probe&1].value = x
+				s.cells.Store(&cellTable{cells: rs, maxLen: maxCells()})
 				atomic.StoreInt32(&s.cellsBusy, 0)
-				break
+				return
 			}
 			atomic.StoreInt32(&s.cellsBusy, 0)
 		} else {
 			v := atomic.LoadInt64(&s.base)
-			var newVal int64
-			if fn == nil {
-				newVal = v + x
-			} else {
-				newVal = fn(v, x)
-			}
-			if s.casBase(v, newVal) {
-				break
+			if s.casBase(v, v+x) {
+				return
 			}
 		}
 	}
-}
-func (s *striped64) isSameReference(test []*cell) bool {
-	val, _ := s.cells.Load().([]*cell)
-	if val == nil && test == nil {
-		return true
-	} else if val == nil || test == nil {
-		return false
-	}
-	return &val[0] == &test[0]
-}
-
-var probeKey = &probeKeyType{}
-
-type probeKeyType struct {
-}
-
-func ContextWithProbe(ctx context.Context, val *int32) context.Context {
-	return context.WithValue(ctx, probeKey, val)
-}
-
-func initProbe(ctx context.Context) int32 {
-	val, _ := ctx.Value(probeKey).(*int32)
-	probe := rand.Int31()
-	if val != nil {
-		*val = probe
-	}
-	return probe
-}
-
-func getProbe(ctx context.Context) int32 {
-	val, ok := ctx.Value(probeKey).(*int32)
-	if val == nil || !ok {
-		return 0
-	} else {
-		return *val
-	}
-}
-
-func advanceProbe(ctx context.Context, probe int32) int32 {
-	probe ^= probe << 13 // xorshift
-	probe ^= probe >> 17
-	probe ^= probe << 5
-
-	val, _ := ctx.Value(probeKey).(*int32)
-	if val != nil {
-		*val = probe
-	}
-	return probe
-}
-
-type cell struct {
-	value int64    // volatile
-	_     [7]int64 // padding for cpu cache-line align
-}
-
-func (c *cell) cas(cmp, val int64) bool {
-	return atomic.CompareAndSwapInt64(&c.value, cmp, val)
-}
-
-func (c *cell) reset(identity int64) {
-	atomic.StoreInt64(&c.value, identity)
-}
-
-func (c *cell) getAndSet(val int64) int64 {
-	return atomic.SwapInt64(&c.value, val)
 }
